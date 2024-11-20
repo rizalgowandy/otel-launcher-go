@@ -17,73 +17,175 @@ package pipelines
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	hostMetrics "go.opentelemetry.io/contrib/instrumentation/host"
-	runtimeMetrics "go.opentelemetry.io/contrib/instrumentation/runtime"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
-	metricglobal "go.opentelemetry.io/otel/metric/global"
-	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
-	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
-	selector "go.opentelemetry.io/otel/sdk/metric/selector/simple"
+	// The Lightstep SDK
+	sdkmetric "github.com/lightstep/otel-launcher-go/lightstep/sdk/metric"
+	"github.com/lightstep/otel-launcher-go/lightstep/sdk/metric/aggregator/aggregation"
+	"github.com/lightstep/otel-launcher-go/lightstep/sdk/metric/exporters/otlp/otelcol"
+	"github.com/lightstep/otel-launcher-go/lightstep/sdk/metric/sdkinstrument"
+	"github.com/lightstep/otel-launcher-go/lightstep/sdk/metric/view"
 	"google.golang.org/grpc/encoding/gzip"
+
+	// The v1 instrumentation
+	lightstepCputime "github.com/lightstep/otel-launcher-go/lightstep/instrumentation/cputime"
+	lightstepHost "github.com/lightstep/otel-launcher-go/lightstep/instrumentation/host"
+	lightstepRuntime "github.com/lightstep/otel-launcher-go/lightstep/instrumentation/runtime"
+
+	// OTel APIs
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
-func NewMetricsPipeline(c PipelineConfig) (func() error, error) {
-	metricExporter, err := c.newMetricsExporter()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create metric exporter: %v", err)
-	}
+func stableHostMetrics(provider metric.MeterProvider) error {
+	return lightstepHost.Start(lightstepHost.WithMeterProvider(provider))
+}
 
-	period := controller.DefaultPeriod
+func stableRuntimeMetrics(provider metric.MeterProvider) error {
+	return lightstepRuntime.Start(lightstepRuntime.WithMeterProvider(provider))
+}
+
+func stableCputimeMetrics(provider metric.MeterProvider) error {
+	return lightstepCputime.Start(lightstepCputime.WithMeterProvider(provider))
+}
+
+type initFunc func(metric.MeterProvider) error
+
+func libraries(inits ...initFunc) []initFunc {
+	return inits
+}
+
+const defaultVersion = "stable"
+
+var builtinMetricsVersions = map[string]map[string][]initFunc{
+	"all": {
+		defaultVersion: libraries(stableHostMetrics, stableRuntimeMetrics, stableCputimeMetrics),
+	},
+	"cputime": {
+		defaultVersion: libraries(stableCputimeMetrics),
+	},
+	"host": {
+		defaultVersion: libraries(stableHostMetrics),
+	},
+	"runtime": {
+		defaultVersion: libraries(stableRuntimeMetrics),
+	},
+}
+
+func NewMetricsPipeline(c PipelineConfig) (func() error, error) {
+	var err error
+
+	period := 30 * time.Second
+
 	if c.ReportingPeriod != "" {
 		period, err = time.ParseDuration(c.ReportingPeriod)
 		if err != nil {
 			return nil, fmt.Errorf("invalid metric reporting period: %v", err)
 		}
 		if period <= 0 {
-
 			return nil, fmt.Errorf("invalid metric reporting period: %v", c.ReportingPeriod)
 		}
 	}
-	pusher := controller.New(
-		processor.NewFactory(
-			selector.NewWithInexpensiveDistribution(),
-			metricExporter,
+	var provider metric.MeterProvider
+	var shutdown func() error
+
+	lsPref, err := tempoOptions(c)
+	lsSecure := c.secureMetricOption()
+	if err != nil {
+		return nil, fmt.Errorf("invalid metric view configuration: %v", err)
+	}
+
+	// Install the Lightstep metrics SDK
+	metricExporter, err := c.newMetricsExporter(lsSecure)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metric exporter: %v", err)
+	}
+
+	sdk := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(c.Resource),
+		sdkmetric.WithReader(
+			sdkmetric.NewPeriodicReader(metricExporter, period),
+			lsPref,
 		),
-		controller.WithExporter(metricExporter),
-		controller.WithResource(c.Resource),
-		controller.WithCollectPeriod(period),
 	)
 
-	if err = pusher.Start(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to start controller: %v", err)
+	provider = sdk
+	shutdown = func() error {
+		return sdk.Shutdown(context.Background())
 	}
 
-	if err = runtimeMetrics.Start(runtimeMetrics.WithMeterProvider(pusher)); err != nil {
-		return nil, fmt.Errorf("failed to start runtime metrics: %v", err)
+	if c.MetricsBuiltinsEnabled {
+		for _, lib := range c.MetricsBuiltinLibraries {
+			name, version, _ := strings.Cut(lib, ":")
+
+			if version == "" {
+				version = defaultVersion
+			}
+
+			vm, has := builtinMetricsVersions[name]
+			if !has {
+				otel.Handle(fmt.Errorf("unrecognized builtin: %q", name))
+				continue
+			}
+			fs, has := vm[version]
+			if !has {
+				otel.Handle(fmt.Errorf("unrecognized builtin version: %v: %q", name, version))
+				continue
+			}
+			for _, f := range fs {
+
+				if err := f(provider); err != nil {
+					otel.Handle(fmt.Errorf("failed to start %v instrumentation: %w", name, err))
+				}
+			}
+		}
 	}
 
-	if err = hostMetrics.Start(hostMetrics.WithMeterProvider(pusher)); err != nil {
-		return nil, fmt.Errorf("failed to start host metrics: %v", err)
-	}
-
-	metricglobal.SetMeterProvider(pusher)
-	return func() error {
-		_ = pusher.Stop(context.Background())
-		return metricExporter.Shutdown(context.Background())
-	}, nil
+	otel.SetMeterProvider(provider)
+	return shutdown, nil
 }
 
-func (c PipelineConfig) newMetricsExporter() (*otlpmetric.Exporter, error) {
-	return otlpmetric.New(
+func (c PipelineConfig) newMetricsExporter(secure otelcol.Option) (sdkmetric.PushExporter, error) {
+	return otelcol.NewExporter(
 		context.Background(),
-		otlpmetricgrpc.NewClient(
-			c.secureMetricOption(),
-			otlpmetricgrpc.WithEndpoint(c.Endpoint),
-			otlpmetricgrpc.WithHeaders(c.Headers),
-			otlpmetricgrpc.WithCompressor(gzip.Name),
+		otelcol.NewConfig(
+			secure,
+			otelcol.WithEndpoint(c.Endpoint),
+			otelcol.WithHeaders(c.Headers),
+			otelcol.WithCompressor(gzip.Name),
 		),
 	)
+}
+
+func tempoOptions(c PipelineConfig) (view.Option, error) {
+	syncPref := aggregation.CumulativeTemporality
+	asyncPref := aggregation.CumulativeTemporality
+
+	switch lower := strings.ToLower(c.TemporalityPreference); lower {
+	case "delta":
+		// Delta means exercising the cumulative-to-delta
+		// export path.  This is an unusual setting for
+		// Lightstep users to choose.
+		syncPref = aggregation.DeltaTemporality
+		asyncPref = aggregation.DeltaTemporality
+	case "stateless", "lowmemory":
+		syncPref = aggregation.DeltaTemporality
+	case "", "cumulative":
+	default:
+		return nil, fmt.Errorf("invalid temporality preference: %v", c.TemporalityPreference)
+
+	}
+	return view.WithDefaultAggregationTemporalitySelector(
+		func(k sdkinstrument.Kind) aggregation.Temporality {
+			switch k {
+			case sdkinstrument.SyncUpDownCounter, sdkinstrument.AsyncUpDownCounter:
+				return aggregation.CumulativeTemporality
+			case sdkinstrument.SyncCounter, sdkinstrument.SyncHistogram:
+				return syncPref
+			default:
+				return asyncPref
+			}
+		},
+	), nil
 }

@@ -21,7 +21,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/encoding/prototext"
 
 	"github.com/lightstep/otel-launcher-go/pipelines/test"
@@ -32,7 +31,7 @@ import (
 )
 
 func TestInsecureTrace(t *testing.T) {
-	server := test.NewServer(t)
+	server := test.NewServer()
 	defer server.Stop()
 
 	shutdown, err := NewTracePipeline(PipelineConfig{
@@ -69,7 +68,7 @@ func TestInsecureTrace(t *testing.T) {
 }
 
 func TestSecureTrace(t *testing.T) {
-	server := test.NewServer(t)
+	server := test.NewServer()
 	defer server.Stop()
 
 	shutdown, err := NewTracePipeline(PipelineConfig{
@@ -82,7 +81,7 @@ func TestSecureTrace(t *testing.T) {
 			attribute.String("test-r1", "test-v1"),
 		),
 		ReportingPeriod: "24h",
-		Credentials:     credentials.NewTLS(newTLSConfig()),
+		TLSSetting:      newTLSClientSetting(),
 		Propagators:     []string{"tracecontext", "baggage"},
 	})
 	assert.NoError(t, err)

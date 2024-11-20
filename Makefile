@@ -17,13 +17,14 @@ TOOLS_MOD_DIR := ./tools
 # All source code and documents. Used in spell check.
 ALL_DOCS := $(shell find . -name '*.md' -type f | sort)
 # All directories with go.mod files related to opentelemetry library. Used for building, testing and linting.
+ALLINCLUSIVE_MODULES := $(shell find . -type f -name "go.mod" -exec dirname {} \; | sort )
 ALL_GO_MOD_DIRS := $(filter-out $(TOOLS_MOD_DIR), $(shell find . -type f -name 'go.mod' -exec dirname {} \; | sort))
 ALL_MODULES := $(filter-out $(TOOLS_MOD_DIR), $(shell find . -type f -name "go.mod" -exec dirname {} \; | sort | egrep  '^./' ))
 ALL_COVERAGE_MOD_DIRS := $(shell find . -type f -name 'go.mod' -exec dirname {} \; | egrep -v '^./example|^$(TOOLS_MOD_DIR)' | sort)
 TAG := "v$(shell cat ./VERSION)"
 
 # Mac OS Catalina 10.5.x doesn't support 386. Hence skip 386 test
-SKIP_386_TEST = false
+SKIP_386_TEST = true
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 	SW_VERS := $(shell sw_vers -productVersion)
@@ -32,7 +33,7 @@ ifeq ($(UNAME_S),Darwin)
 	endif
 endif
 
-GOTEST_MIN = go test -v -timeout 60s
+GOTEST_MIN = go test -v -timeout 120s
 GOTEST = $(GOTEST_MIN) -race
 GOTEST_WITH_COVERAGE = $(GOTEST) -coverprofile=coverage.txt -covermode=atomic -coverpkg=./...
 
@@ -41,6 +42,7 @@ GOTEST_WITH_COVERAGE = $(GOTEST) -coverprofile=coverage.txt -covermode=atomic -c
 .PHONY: precommit
 
 TOOLS_DIR := $(abspath ./.tools)
+
 
 $(TOOLS_DIR)/golangci-lint: $(TOOLS_MOD_DIR)/go.mod $(TOOLS_MOD_DIR)/go.sum $(TOOLS_MOD_DIR)/tools.go
 	cd $(TOOLS_MOD_DIR) && \
@@ -79,6 +81,7 @@ check-clean-work-tree:
 	  echo 'Working tree is not clean, did you forget to run "make precommit"?'; \
 	  echo; \
 	  git status; \
+	  git diff; \
 	  exit 1; \
 	fi
 
@@ -98,6 +101,14 @@ test:
 	  echo "go test ./... + race in $${dir}"; \
 	  (cd "$${dir}" && \
 	    $(GOTEST) ./...); \
+	done
+
+.PHONY: fmt
+fmt:
+	set -e; for dir in $(ALL_GO_MOD_DIRS); do \
+	  echo "go fmt in $${dir}"; \
+	  (cd "$${dir}" && \
+	    go fmt ./...); \
 	done
 
 .PHONY: test-386
@@ -162,6 +173,12 @@ ifdef ver
 else
 		@echo 'ver not defined. call make ver=<version eg 1.2.3> version'
 endif
+
+.PHONY: gotidy
+gotidy:
+	@set -e; for dir in $(ALLINCLUSIVE_MODULES); do \
+	  (echo Tidying "$${dir}" && cd $${dir} && GOWORK=off go mod tidy ); \
+	done
 
 .PHONY: add-tag
 add-tag:

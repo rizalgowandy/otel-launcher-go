@@ -141,10 +141,35 @@ func WithMetricReportingPeriod(p time.Duration) Option {
 	}
 }
 
-// WithMetricEnabled configures whether metrics should be enabled
+// WithMetricTemporalityPreference controls the temporality preference
+// used for Counter and Histogram (only not for UpDownCounter, which
+// ignores this preference for specified reasons).
+func WithMetricExporterTemporalityPreference(prefName string) Option {
+	return func(c *Config) {
+		c.MetricExporterTemporalityPreference = prefName
+	}
+}
+
+// WithMetricEnabled configures whether metrics should be enabled.
 func WithMetricsEnabled(enabled bool) Option {
 	return func(c *Config) {
 		c.MetricsEnabled = enabled
+	}
+}
+
+// WithMetricBuiltinsEnabled configures whether builtin metrics should
+// be enabled.  Metrics will be disabled when MetricsEnabled is false.
+func WithMetricsBuiltinsEnabled(builtinsEnabled bool) Option {
+	return func(c *Config) {
+		c.MetricsBuiltinsEnabled = builtinsEnabled
+	}
+}
+
+// WithMetricsBuiltinLibraries configures the set of builtin metrics
+// libraries that are started automatically.  When this is
+func WithMetricsBuiltinLibraries(builtinLibraries []string) Option {
+	return func(c *Config) {
+		c.MetricsBuiltinLibraries = builtinLibraries
 	}
 }
 
@@ -157,6 +182,12 @@ func WithLogger(logger Logger) Option {
 	return func(c *Config) {
 		c.logger = logger
 	}
+}
+
+// WithLightstepMetricsSDK is a no-op.  The Lightstep Metrics SDK is
+// always used.
+func WithLightstepMetricsSDK(alt bool) Option {
+	return func(c *Config) {}
 }
 
 type DefaultLogger struct {
@@ -188,21 +219,24 @@ const (
 )
 
 type Config struct {
-	SpanExporterEndpoint           string            `env:"OTEL_EXPORTER_OTLP_SPAN_ENDPOINT,default=ingest.lightstep.com:443"`
-	SpanExporterEndpointInsecure   bool              `env:"OTEL_EXPORTER_OTLP_SPAN_INSECURE,default=false"`
-	ServiceName                    string            `env:"LS_SERVICE_NAME"`
-	ServiceVersion                 string            `env:"LS_SERVICE_VERSION,default=unknown"`
-	Headers                        map[string]string `env:"OTEL_EXPORTER_OTLP_HEADERS"`
-	MetricExporterEndpoint         string            `env:"OTEL_EXPORTER_OTLP_METRIC_ENDPOINT,default=ingest.lightstep.com:443"`
-	MetricExporterEndpointInsecure bool              `env:"OTEL_EXPORTER_OTLP_METRIC_INSECURE,default=false"`
-	MetricsEnabled                 bool              `env:"LS_METRICS_ENABLED,default=true"`
-	LogLevel                       string            `env:"OTEL_LOG_LEVEL,default=info"`
-	Propagators                    []string          `env:"OTEL_PROPAGATORS,default=b3"`
-	MetricReportingPeriod          string            `env:"OTEL_EXPORTER_OTLP_METRIC_PERIOD,default=30s"`
-	ResourceAttributes             map[string]string
-	Resource                       *resource.Resource
-	logger                         Logger
-	errorHandler                   otel.ErrorHandler
+	SpanExporterEndpoint                string            `env:"OTEL_EXPORTER_OTLP_SPAN_ENDPOINT,default=ingest.lightstep.com:443"`
+	SpanExporterEndpointInsecure        bool              `env:"OTEL_EXPORTER_OTLP_SPAN_INSECURE,default=false"`
+	ServiceName                         string            `env:"LS_SERVICE_NAME"`
+	ServiceVersion                      string            `env:"LS_SERVICE_VERSION,default=unknown"`
+	Headers                             map[string]string `env:"OTEL_EXPORTER_OTLP_HEADERS"`
+	MetricExporterEndpoint              string            `env:"OTEL_EXPORTER_OTLP_METRIC_ENDPOINT,default=ingest.lightstep.com:443"`
+	MetricExporterEndpointInsecure      bool              `env:"OTEL_EXPORTER_OTLP_METRIC_INSECURE,default=false"`
+	MetricExporterTemporalityPreference string            `env:"OTEL_EXPORTER_OTLP_METRIC_TEMPORALITY_PREFERENCE,default=cumulative"`
+	MetricsEnabled                      bool              `env:"LS_METRICS_ENABLED,default=true"`
+	MetricsBuiltinsEnabled              bool              `env:"LS_METRICS_BUILTINS_ENABLED,default=true"`
+	MetricsBuiltinLibraries             []string          `env:"LS_METRICS_BUILTIN_LIBRARIES,default=all:stable"`
+	LogLevel                            string            `env:"OTEL_LOG_LEVEL,default=info"`
+	Propagators                         []string          `env:"OTEL_PROPAGATORS,default=b3"`
+	MetricReportingPeriod               string            `env:"OTEL_EXPORTER_OTLP_METRIC_PERIOD,default=30s"`
+	ResourceAttributes                  map[string]string
+	Resource                            *resource.Resource
+	logger                              Logger
+	errorHandler                        otel.ErrorHandler
 }
 
 func checkEndpointDefault(value, defValue string) error {
@@ -250,11 +284,6 @@ func validateConfiguration(c Config) error {
 		}
 	}
 
-	// TODO(@tobert) will probably break on some providers but seems fine for my use cases right now
-	if accessTokenLen > 0 && (accessTokenLen != 32 && accessTokenLen != 84 && accessTokenLen != 104 && accessToken(c) != "developer") {
-		return fmt.Errorf("invalid configuration: access token length incorrect. Ensure token is set correctly")
-	}
-
 	return nil
 }
 
@@ -296,6 +325,8 @@ func newResource(c *Config) *resource.Resource {
 		semconv.TelemetrySDKNameKey.String("launcher"),
 		semconv.TelemetrySDKLanguageGo,
 		semconv.TelemetrySDKVersionKey.String(version),
+		attribute.String("telemetry.distro.name", "lightstep"),
+		attribute.String("telemetry.distro.version", version),
 	}
 
 	if len(c.ServiceName) > 0 {
@@ -361,11 +392,14 @@ func setupMetrics(c Config) (func() error, error) {
 		return nil, nil
 	}
 	return pipelines.NewMetricsPipeline(pipelines.PipelineConfig{
-		Endpoint:        c.MetricExporterEndpoint,
-		Insecure:        c.MetricExporterEndpointInsecure,
-		Headers:         c.Headers,
-		Resource:        c.Resource,
-		ReportingPeriod: c.MetricReportingPeriod,
+		Endpoint:                c.MetricExporterEndpoint,
+		Insecure:                c.MetricExporterEndpointInsecure,
+		Headers:                 c.Headers,
+		Resource:                c.Resource,
+		ReportingPeriod:         c.MetricReportingPeriod,
+		TemporalityPreference:   c.MetricExporterTemporalityPreference,
+		MetricsBuiltinsEnabled:  c.MetricsBuiltinsEnabled,
+		MetricsBuiltinLibraries: c.MetricsBuiltinLibraries,
 	})
 }
 
